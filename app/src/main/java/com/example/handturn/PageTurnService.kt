@@ -1,0 +1,536 @@
+package com.example.handturn
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.TextView
+import android.widget.Toast
+
+/** 手勢翻頁：讚=下頁，七=上頁。前鏡頭只在閱讀時開，其餘門控沿用自動翻頁版。 */
+class PageTurnService : AccessibilityService() {
+
+    companion object {
+        const val PREFS = "cfg"
+        const val KEY_COOLDOWN = "cooldown"
+        const val KEY_OVERLAY = "overlay"
+        const val KEY_APPS = "apps"
+        const val KEY_RUNNING = "run"
+        const val KEY_SERVICE = "service"
+        const val KEY_ALPHA = "alpha"
+        const val KEY_PVW = "pvw"
+        const val KEY_PVALPHA = "pvAlpha"
+        val DEFAULT_APPS = setOf("com.tencent.weread")
+
+        // ponytail: static 當跨 Activity/Service 通訊，存 DB / Intent 是多餘的
+        @Volatile var serviceOn = false
+        @Volatile var running = false
+        @Volatile var cooldownMs = 1500L
+        @Volatile var overlayOn = true
+        @Volatile var allowedApps: Set<String> = DEFAULT_APPS
+        @Volatile var ballAlpha = 50
+        @Volatile var previewWdp = 200 // 懸浮預覽窗寬 dp，高=寬*3/4；default 200x150
+        @Volatile var previewAlpha = 100
+        @Volatile var currentPkg: String = ""
+        @Volatile var instance: PageTurnService? = null
+
+        fun loadPrefs(ctx: Context) {
+            val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            serviceOn = p.getBoolean(KEY_SERVICE, false)
+            running = p.getBoolean(KEY_RUNNING, false)
+            cooldownMs = p.getInt(KEY_COOLDOWN, 3000).coerceIn(1000, 30000).toLong()
+            overlayOn = p.getBoolean(KEY_OVERLAY, true)
+            allowedApps = p.getStringSet(KEY_APPS, DEFAULT_APPS) ?: DEFAULT_APPS
+            ballAlpha = p.getInt(KEY_ALPHA, 50).coerceIn(10, 100)
+            previewWdp = p.getInt(KEY_PVW, 200).coerceIn(80, 400)
+            previewAlpha = p.getInt(KEY_PVALPHA, 100).coerceIn(10, 100)
+        }
+
+        fun saveRunning(ctx: Context) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_RUNNING, running)
+                .putBoolean(KEY_SERVICE, serviceOn).apply()
+        }
+    }
+
+    private var lastPkgAt = 0L
+    @Volatile var inOwnApp = false
+    private var tracker: HandTracker? = null
+    private var trackerHasPreview = false
+    private val handler = Handler(Looper.getMainLooper())
+
+    // ponytail: 瘦身時砍掉 tick 迴圈是回歸——事件一漏球就回不來；2 秒看門狗只做狀態自癒，不跑相機不耗電
+    private val watchdog = object : Runnable {
+        override fun run() {
+            try {
+                refreshForeground() // 用活的 active window 校準，事件漏了也不瞎
+                if (overlayOn && ball == null && !surelyOutside()) showOverlay()
+                refreshBall()
+                if (tracker?.running == true) {
+                    if (previewBox == null) showPreviewWindow()
+                    else if (previewSurface != null && !trackerHasPreview) {
+                        tracker?.stop() // 裸跑（沒接預覽面）→ 重啟接入
+                        startTracker(previewSurface)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                handler.postDelayed(this, 2000)
+            }
+        }
+    }
+
+    private fun active() = serviceOn && running
+
+    private fun visiblePkg(): String? {
+        val v = try { rootInActiveWindow?.packageName?.toString() } catch (_: Exception) { null }
+        if (v.isNullOrEmpty() || transientPkgs.contains(v)) return null
+        return v
+    }
+
+    private fun refreshForeground() {
+        visiblePkg()?.let {
+            if (it != currentPkg) {
+                currentPkg = it
+                lastPkgAt = SystemClock.uptimeMillis()
+            }
+            inOwnApp = it == packageName
+        }
+    }
+
+    /** 真的在外面才回 true。自家設定頁不算外面（翻頁由 inOwnApp 擋，球要留）。 */
+    private fun surelyOutside(): Boolean {
+        visiblePkg()?.let {
+            if (it == packageName) return false
+            return !isAllowed(it)
+        }
+        if (currentPkg.isEmpty() || isAllowed(currentPkg)) return false
+        return SystemClock.uptimeMillis() - lastPkgAt < 3000
+    }
+
+    private fun flipBlocked(): Boolean {
+        if (inOwnApp) return true
+        return surelyOutside()
+    }
+
+    // ---- overlay ----
+    private var wm: WindowManager? = null
+    private var ball: TextView? = null
+    private var ballParams: WindowManager.LayoutParams? = null
+    // 懸浮預覽窗：跟相機同開同關；本體拖移，右下角熱區拖縮放（4:3）
+    private var previewBox: View? = null
+    private var previewParams: WindowManager.LayoutParams? = null
+    private var previewSurface: android.view.Surface? = null
+    private var previewPending = false
+
+    override fun onServiceConnected() {
+        instance = this
+        loadPrefs(this)
+        currentPkg = "unknown"
+        lastPkgAt = SystemClock.uptimeMillis()
+        if (overlayOn && !inOwnApp) showOverlay()
+        if (serviceOn && running) updateCamera()
+        handler.removeCallbacks(watchdog)
+        handler.post(watchdog)
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event ?: return
+        val pkg = event.packageName?.toString() ?: ""
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val cls = event.className?.toString() ?: ""
+            // ponytail: 球自身懸浮窗也會送自家包名事件（非 MainActivity），忽略否則相機開關抖動
+            if (pkg == packageName && !cls.contains("MainActivity")) return
+            if (pkg == packageName) {
+                inOwnApp = true
+                updateCamera() // 自家頁關相機（隱私+省電），running 保留
+            } else if (pkg.isNotEmpty() && !transientPkgs.contains(pkg)) {
+                inOwnApp = false
+            }
+            if (pkg.isNotEmpty() && !transientPkgs.contains(pkg) && pkg != packageName) {
+                currentPkg = pkg
+                lastPkgAt = SystemClock.uptimeMillis()
+            }
+            if (pkg.isNotEmpty()) onForeground(pkg)
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // ponytail: 點位按當下 metrics 算，直橫皆通；這裡只夾球回可視範圍
+        val (sw, sh) = screenSize()
+        ballParams?.let { bp ->
+            bp.x = bp.x.coerceIn(0, (sw - dp(56)).coerceAtLeast(0))
+            bp.y = bp.y.coerceIn(0, (sh - dp(56)).coerceAtLeast(0))
+            if (ball != null) try { wm?.updateViewLayout(ball, bp) } catch (_: Exception) {}
+        }
+        previewParams?.let { pp ->
+            val maxW = (sw / 2).coerceAtLeast(dp(80))
+            pp.width = pp.width.coerceIn(dp(80), maxW)
+            pp.height = pp.width * 3 / 4
+            pp.x = pp.x.coerceIn(0, (sw - pp.width).coerceAtLeast(0))
+            pp.y = pp.y.coerceIn(0, (sh - pp.height).coerceAtLeast(0))
+            if (previewBox != null) try { wm?.updateViewLayout(previewBox, pp) } catch (_: Exception) {}
+        }
+        refitPreview()
+    }
+
+    override fun onInterrupt() {}
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        handler.removeCallbacks(watchdog)
+        releaseCamera()
+        tracker?.close(); tracker = null
+        hideOverlay()
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    fun start() {
+        if (!serviceOn) return
+        inOwnApp = false
+        running = true
+        saveRunning(this)
+        updateCamera()
+        refreshBall()
+    }
+
+    fun stop() {
+        running = false
+        saveRunning(this)
+        releaseCamera()
+        refreshBall()
+    }
+
+    fun applySettings() {
+        loadPrefs(this)
+        tracker?.cooldownMs = cooldownMs
+        if (!overlayOn) hideOverlay()
+        else showOverlay()
+        refitPreview() // 大小/透明度即時生效
+        updateCamera()
+        refreshBall()
+    }
+
+    private fun isAllowed(pkg: String): Boolean {
+        if (allowedApps.isEmpty()) return true
+        if (pkg.isEmpty()) return true
+        return allowedApps.contains(pkg)
+    }
+
+    private val transientPkgs = setOf(
+        "android",
+        "com.android.systemui",
+        "com.android.permissioncontroller",
+        "com.android.packageinstaller"
+    )
+
+    private fun isLauncher(pkg: String): Boolean {
+        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        return packageManager.queryIntentActivities(home, 0)
+            .any { it.activityInfo.packageName == pkg }
+    }
+
+    private fun onForeground(pkg: String) {
+        if (transientPkgs.contains(pkg)) return
+        if (pkg == packageName) {
+            updateCamera() // 自家頁關相機（隱私+省電），running 保留
+            if (overlayOn) { showOverlay(); refreshBall() } else hideOverlay()
+            return
+        }
+        if (isAllowed(pkg)) {
+            if (overlayOn) { showOverlay(); refreshBall() }
+            updateCamera()
+            return
+        }
+        if (isLauncher(pkg)) {
+            if (active()) stop()
+            hideOverlay()
+        } else if (active()) {
+            stop()
+        }
+    }
+
+    // ---- camera lifecycle：只在閱讀時開 ----
+    private fun updateCamera() {
+        refreshForeground()
+        if (active() && !flipBlocked()) ensureCamera() else releaseCamera()
+    }
+
+    private fun ensureCamera() {
+        if (tracker?.running == true) return
+        showPreviewWindow() // 有懸浮窗權限才有小窗；失敗就無預覽照跑
+        val ps = previewSurface
+        if (previewBox != null && ps == null) {
+            // 等小窗表面就緒再開相機，2 秒沒好就無預覽先開
+            previewPending = true
+            previewBox?.postDelayed({
+                if (previewPending) {
+                    previewPending = false
+                    startTracker(previewSurface)
+                }
+            }, 2000)
+            return
+        }
+        startTracker(ps)
+    }
+
+    private fun startTracker(ps: android.view.Surface?) {
+        if (tracker?.running == true) return
+        val t = tracker ?: HandTracker(
+            this,
+            onNext = { if (!flipBlocked()) tapNextPage() },
+            onPrev = { if (!flipBlocked()) tapPrevPage() },
+            onStatus = {},
+        ).also { tracker = it }
+        t.cooldownMs = cooldownMs
+        if (!t.start(ps)) {
+            // 相機開不了（權限/模型）：停本次免得空轉，回設定頁看提示
+            Toast.makeText(this, "相機/模型沒就緒，去設定頁檢查", Toast.LENGTH_SHORT).show()
+            stop()
+        } else {
+            trackerHasPreview = ps != null
+        }
+    }
+
+    private fun releaseCamera() {
+        previewPending = false
+        trackerHasPreview = false
+        try { tracker?.stop() } catch (_: Exception) {}
+        hidePreviewWindow()
+    }
+
+    // ---- gestures out ----
+    private fun tapAt(fracX: Float) {
+        val (w, h) = screenSize()
+        val x = w * fracX
+        val y = h * 0.5f
+        // 只有 moveTo 是零長度手勢，部分 ROM 直接丟掉，補 1px 才會真的 dispatch
+        val path = Path().apply { moveTo(x, y); lineTo(x + 1, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
+            .build()
+        val ok = dispatchGesture(gesture, null, null)
+        if (!ok) stop()
+    }
+
+    private fun tapNextPage() = tapAt(0.8f) // 右中=下頁
+    private fun tapPrevPage() = tapAt(0.2f) // 左中=上頁
+
+    // ---- 懸浮球 ----
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    // ponytail: dispatchGesture 吃螢幕座標；displayMetrics 在橫屏/手勢列下會偏小，API 30+ 用真實螢幕尺寸
+    private fun screenSize(): Pair<Int, Int> {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                val b = w.maximumWindowMetrics.bounds
+                if (b.width() > 0 && b.height() > 0) return b.width() to b.height()
+            }
+        } catch (_: Exception) {}
+        val m = resources.displayMetrics
+        return m.widthPixels to m.heightPixels
+    }
+
+    private fun showOverlay() {
+        if (ball != null) {
+            refreshBall()
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) return
+        val w = getSystemService(WINDOW_SERVICE) as WindowManager
+        wm = w
+        val (sw, sh) = screenSize()
+        val b = TextView(this).apply {
+            textSize = 20f
+            gravity = Gravity.CENTER
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(Color.parseColor("#8066BB6A"))
+            }
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            minimumWidth = dp(56)
+            minimumHeight = dp(56)
+        }
+        val bp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.START or Gravity.TOP
+            x = sw - dp(90)
+            y = sh / 2
+        }
+        var downX = 0f; var downY = 0f; var baseX = 0; var baseY = 0; var moved = false
+        val longPress = Runnable {
+            if (!moved) {
+                moved = true
+                startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+        }
+        b.setOnTouchListener { v, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY
+                    baseX = bp.x; baseY = bp.y; moved = false
+                    b.postDelayed(longPress, 600)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (e.rawX - downX).toInt()
+                    val dy = (e.rawY - downY).toInt()
+                    if (dx * dx + dy * dy > dp(10) * dp(10)) moved = true
+                    if (moved) {
+                        b.removeCallbacks(longPress)
+                        bp.x = baseX + dx; bp.y = baseY + dy
+                        wm?.updateViewLayout(v, bp)
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    b.removeCallbacks(longPress)
+                    if (!moved) {
+                        if (!serviceOn) {
+                            Toast.makeText(this, "先去設定頁開啟翻頁服務", Toast.LENGTH_SHORT).show()
+                        } else if (running) stop() else start()
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> b.removeCallbacks(longPress)
+            }
+            true
+        }
+        ball = b
+        ballParams = bp
+        w.addView(b, bp)
+        refreshBall()
+    }
+
+    private fun refreshBall() {
+        ball?.text = if (active()) "❚❚" else "▶"
+        ball?.alpha = ballAlpha / 100f
+        ball?.visibility = if (overlayOn) View.VISIBLE else View.GONE
+    }
+
+    private fun hideOverlay() {
+        hidePreviewWindow() // 先清預覽窗，wm 置空後就刪不掉了
+        val w = wm ?: return
+        ball?.let { b ->
+            try { w.removeView(b) } catch (_: Exception) {}
+        }
+        ball = null
+        ballParams = null
+        wm = null
+    }
+
+    // ---- 懸浮預覽窗：跟相機同開同關，出入鏡一眼看出 ----
+    private fun showPreviewWindow() {
+        if (previewBox != null) return
+        if (!Settings.canDrawOverlays(this)) return
+        val w = getSystemService(WINDOW_SERVICE) as WindowManager
+        wm = w
+        val maxW = (screenSize().first / 2).coerceAtLeast(dp(80))
+        val initW = dp(previewWdp).coerceIn(dp(80), maxW)
+        val tv = android.view.TextureView(this).apply { alpha = previewAlpha / 100f }
+        val box = android.widget.FrameLayout(this).apply {
+            setBackgroundColor(Color.parseColor("#CC000000"))
+            addView(tv, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+        val pp = WindowManager.LayoutParams(
+            initW, initW * 3 / 4,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.START or Gravity.TOP; x = dp(16); y = dp(100) }
+        tv.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, ww: Int, hh: Int) {
+                st.setDefaultBufferSize(HandTracker.W, HandTracker.H) // 固定 4:3，轉正矩陣才對得上
+                previewSurface = android.view.Surface(st)
+                if (previewPending) { previewPending = false; startTracker(previewSurface) }
+                else if (tracker?.running == true && !trackerHasPreview) {
+                    tracker?.stop() // 窗後建的（看門狗重建）：重啟把面接上
+                    startTracker(previewSurface)
+                }
+            }
+            override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, ww: Int, hh: Int) {}
+            override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
+                previewSurface = null; return true
+            }
+            override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
+        }
+        // ponytail: 本體拖移，右下角 40dp 熱區拖縮放（4:3，上限半屏；放開存檔）
+        var lx = 0f; var ly = 0f; var sx = 0; var sy = 0; var sw0 = 0; var resizing = false
+        box.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    lx = e.rawX; ly = e.rawY; sx = pp.x; sy = pp.y; sw0 = pp.width
+                    resizing = e.x > box.width - dp(40) && e.y > box.height - dp(40)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (e.rawX - lx).toInt(); val dy = (e.rawY - ly).toInt()
+                    if (resizing) {
+                        val mx = (screenSize().first / 2).coerceAtLeast(dp(80))
+                        pp.width = (sw0 + dx).coerceIn(dp(80), mx)
+                        pp.height = pp.width * 3 / 4
+                    } else { pp.x = sx + dx; pp.y = sy + dy }
+                    try { w.updateViewLayout(box, pp) } catch (_: Exception) {}
+                    tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (resizing) {
+                        previewWdp = (pp.width / resources.displayMetrics.density).toInt().coerceIn(80, 400)
+                        getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                            .edit().putInt(KEY_PVW, previewWdp).apply()
+                    }
+                    resizing = false
+                }
+            }
+            true
+        }
+        previewBox = box
+        previewParams = pp
+        try {
+            w.addView(box, pp)
+            tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
+        } catch (_: Exception) { previewBox = null; previewParams = null }
+    }
+
+    /** 設定頁改大小/透明度＋轉屏後重算（轉正＋透明度即時生效）。 */
+    private fun refitPreview() {
+        val box = previewBox as? android.widget.FrameLayout ?: return
+        val pp = previewParams ?: return
+        val maxW = (screenSize().first / 2).coerceAtLeast(dp(80))
+        pp.width = dp(previewWdp).coerceIn(dp(80), maxW)
+        pp.height = pp.width * 3 / 4
+        try { wm?.updateViewLayout(box, pp) } catch (_: Exception) {}
+        (box.getChildAt(0) as? android.view.TextureView)?.let { tv ->
+            tv.alpha = previewAlpha / 100f
+            tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
+        }
+    }
+
+    private fun hidePreviewWindow() {
+        val w = wm
+        previewBox?.let { b -> try { w?.removeView(b) } catch (_: Exception) {} }
+        previewBox = null
+        previewParams = null
+        try { previewSurface?.release() } catch (_: Exception) {}
+        previewSurface = null
+    }
+}
