@@ -81,7 +81,9 @@ class PageTurnService : AccessibilityService() {
         override fun run() {
             try {
                 refreshForeground() // 用活的 active window 校準，事件漏了也不瞎
-                if (overlayOn && ball == null && !surelyOutside()) showOverlay()
+                if (overlayOn && ball == null && surelyInside()) showOverlay()
+                // ponytail: 相機跑著（翻頁中）不藏球——不然停止鍵沒了；真在外面事件會先停相機，下輪再藏
+                else if (ball != null && tracker?.running != true && !surelyInside()) hideOverlay()
                 refreshBall()
                 // 閒置超時：一段時間沒翻頁就關相機停球（省電，人走開不用管）
                 if (active() && SystemClock.uptimeMillis() - lastFlipAt > idleMs) {
@@ -129,6 +131,21 @@ class PageTurnService : AccessibilityService() {
         return SystemClock.uptimeMillis() - lastPkgAt < 3000
     }
 
+    /**
+     * 真的在裡面（自家或白名單）才回 true，預設藏球。
+     * ponytail: 10 秒內事件優先——進書頁事件可靠，眼睛在特殊 ROM/懸浮層下會看錯對象；
+     * 陳舊分支不過期（安全視窗閱讀頁無事件又看不見 root，過期會藏球）。
+     */
+    private fun surelyInside(): Boolean {
+        if (currentPkg.isNotEmpty() && SystemClock.uptimeMillis() - lastPkgAt < 10000) {
+            return if (currentPkg == packageName) inOwnApp else isAllowed(currentPkg)
+        }
+        visiblePkg()?.let { return it == packageName || isAllowed(it) }
+        if (currentPkg.isEmpty()) return false
+        if (currentPkg == packageName) return inOwnApp
+        return isAllowed(currentPkg)
+    }
+
     private fun flipBlocked(): Boolean {
         if (inOwnApp) return true
         return surelyOutside()
@@ -149,7 +166,8 @@ class PageTurnService : AccessibilityService() {
         loadPrefs(this)
         currentPkg = "unknown"
         lastPkgAt = SystemClock.uptimeMillis()
-        if (overlayOn && !inOwnApp) showOverlay()
+        refreshForeground()
+        if (overlayOn && surelyInside()) showOverlay()
         if (serviceOn && running) updateCamera()
         handler.removeCallbacks(watchdog)
         handler.post(watchdog)
@@ -275,9 +293,11 @@ class PageTurnService : AccessibilityService() {
         }
         if (isLauncher(pkg)) {
             if (active()) stop()
+            hideOverlay() // 桌面一定藏球，不管有沒有在翻
+        } else {
+            // 非白名單：一律停＋藏球；球只許出現在自家和白名單
+            if (active()) stop()
             hideOverlay()
-        } else if (active()) {
-            stop()
         }
     }
 
