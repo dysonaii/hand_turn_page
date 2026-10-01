@@ -12,11 +12,11 @@
 | 看鏡頭有沒有看到手 | 懸浮預覽窗 | 跟相機同開同關；本體拖移，右下角拖縮放 |
 | 喬角度 | 設定頁「手勢測試開/關」 | 30 秒小窗預覽＋辨識狀態，拳頭/剪刀會 Toast（不翻頁） |
 | 調連翻間隔 | 設定頁「翻頁冷卻」1~30 秒 | 預設 3 秒；冷卻內手勢丟掉 |
-| 人走開自動停 | 設定頁「閒置自動停」1~30 分鐘 | 預設 5 分鐘沒翻頁：關相機＋停球＋關小窗 |
+| 人走開自動停 | 設定頁「閒置自動停」1~30 分鐘 | 預設 5 分鐘沒翻頁：關相機＋停球＋關小窗；自己用手滑頁也算活著，會重數 |
 | 只在特定 App 翻 | 設定頁「選擇可翻頁的 App」 | 預設只勾微信讀書；全不勾＝全部允許 |
 | 調懸浮球深淺 | 設定頁「懸浮球透明度」10~100% | 即時生效 |
 | 調預覽窗大小深淺 | 設定頁「預覽窗大小」80~400dp／「透明度」10~100% | 預設 200x150；拖縮放放開自動記住 |
-| 回設定頁改東西 | 長按懸浮球 | 跳回設定頁；回設定頁自動停本次會話 |
+| 回設定頁改東西 | 長按懸浮球 600ms | 跳回設定頁；回設定頁自動停本次會話 |
 | 橫屏也在翻 | 把手機轉橫 | 點位重算，預覽窗轉正跟著轉 |
 
 ## 翻頁規則（四條）
@@ -42,14 +42,15 @@
 
 * **比了不翻**：手有沒有進小窗；同手勢鎖住中（換手勢或出鏡再比）；冷卻還沒過；白名單有沒有勾該 App。
 * **小窗人像是歪的**：報方向（豎屏／橫屏充電口左右），轉正矩陣按機型調。
-* **球 ❚❚ 但不翻**：剛切進書頁 3 秒內是校準期，等一下；符合的話 2 秒看門狗會自癒。
+* **球 ❚❚ 但不翻**：剛切進書頁 3 秒內是校準期，等一下；球不見的話 2 秒看門狗會自己長回來。
 * **每次 Run 都要重開無障礙**：完整解除安裝會清系統綁定，屬 Android 設計。改用 Apply Changes 或 `adb install -r` 覆蓋。
 
 ## 模型檔（編譯前必放）
 
-`app/src/main/assets/hand_landmarker.task` 沒進 git（約 8MB），去
-[MediaPipe HandLandmarker](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker#models)
-下載 `hand_landmarker.task` 放進 `app/src/main/assets/`。
+`app/src/main/assets/hand_landmarker.task` 沒進 git（約 8MB），直接抓官方檔放進 `app/src/main/assets/`：
+
+`https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`
+
 沒放的話開鏡頭會 Toast 提示，不會炸。
 
 ## 開發者
