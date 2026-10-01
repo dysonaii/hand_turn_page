@@ -25,6 +25,8 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var coolLabel: TextView
     private lateinit var coolSeek: SeekBar
+    private lateinit var idleLabel: TextView
+    private lateinit var idleSeek: SeekBar
     private lateinit var overlayBox: CheckBox
     private lateinit var alphaLabel: TextView
     private lateinit var alphaSeek: SeekBar
@@ -56,6 +58,19 @@ class MainActivity : Activity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) {
                     coolLabel.text = "翻頁冷卻：${v + 1} 秒"
+                    save()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        idleLabel = TextView(this)
+        idleSeek = SeekBar(this).apply {
+            max = 29 // 1~30 分鐘；default 5
+            progress = (p.getInt(PageTurnService.KEY_IDLE, 5) - 1).coerceIn(0, 29)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) {
+                    idleLabel.text = "閒置自動停：${v + 1} 分鐘沒翻頁"
                     save()
                 }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
@@ -149,6 +164,8 @@ class MainActivity : Activity() {
             addView(TextView(context).apply { text = "手勢：拳頭=下頁，剪刀（食指+中指）=上頁；同手勢不連翻" })
             addView(coolLabel)
             addView(coolSeek)
+            addView(idleLabel)
+            addView(idleSeek)
             addView(overlayBox)
             addView(alphaLabel)
             addView(alphaSeek)
@@ -167,6 +184,7 @@ class MainActivity : Activity() {
         }
         setContentView(ScrollView(this).apply { addView(layout) })
         coolLabel.text = "翻頁冷卻：${coolSeek.progress + 1} 秒"
+        idleLabel.text = "閒置自動停：${idleSeek.progress + 1} 分鐘沒翻頁"
         alphaLabel.text = "懸浮球透明度：${alphaSeek.progress + 10}%"
         pvSizeLabel.text = "預覽窗大小：${80 + pvSizeSeek.progress * 10}dp"
         pvAlphaLabel.text = "預覽窗透明度：${pvAlphaSeek.progress + 10}%"
@@ -198,6 +216,7 @@ class MainActivity : Activity() {
     private fun save() {
         prefs().edit()
             .putInt(PageTurnService.KEY_COOLDOWN, (coolSeek.progress + 1) * 1000)
+            .putInt(PageTurnService.KEY_IDLE, idleSeek.progress + 1)
             .putBoolean(PageTurnService.KEY_OVERLAY, overlayBox.isChecked)
             .putInt(PageTurnService.KEY_ALPHA, alphaSeek.progress + 10)
             .putInt(PageTurnService.KEY_PVW, 80 + pvSizeSeek.progress * 10)

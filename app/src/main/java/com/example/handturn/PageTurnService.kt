@@ -33,6 +33,7 @@ class PageTurnService : AccessibilityService() {
         const val KEY_ALPHA = "alpha"
         const val KEY_PVW = "pvw"
         const val KEY_PVALPHA = "pvAlpha"
+        const val KEY_IDLE = "idle"
         val DEFAULT_APPS = setOf("com.tencent.weread")
 
         // ponytail: static 當跨 Activity/Service 通訊，存 DB / Intent 是多餘的
@@ -44,6 +45,7 @@ class PageTurnService : AccessibilityService() {
         @Volatile var ballAlpha = 50
         @Volatile var previewWdp = 200 // 懸浮預覽窗寬 dp，高=寬*3/4；default 200x150
         @Volatile var previewAlpha = 100
+        @Volatile var idleMs = 5 * 60 * 1000L // 閒置多久沒翻頁自動停；default 5 分鐘
         @Volatile var currentPkg: String = ""
         @Volatile var instance: PageTurnService? = null
 
@@ -57,6 +59,7 @@ class PageTurnService : AccessibilityService() {
             ballAlpha = p.getInt(KEY_ALPHA, 50).coerceIn(10, 100)
             previewWdp = p.getInt(KEY_PVW, 200).coerceIn(80, 400)
             previewAlpha = p.getInt(KEY_PVALPHA, 100).coerceIn(10, 100)
+            idleMs = p.getInt(KEY_IDLE, 5).coerceIn(1, 30) * 60 * 1000L
         }
 
         fun saveRunning(ctx: Context) {
@@ -70,6 +73,7 @@ class PageTurnService : AccessibilityService() {
     @Volatile var inOwnApp = false
     private var tracker: HandTracker? = null
     private var trackerHasPreview = false
+    private var lastFlipAt = 0L // 上次成功翻頁；閒置超時自動停用
     private val handler = Handler(Looper.getMainLooper())
 
     // ponytail: 瘦身時砍掉 tick 迴圈是回歸——事件一漏球就回不來；2 秒看門狗只做狀態自癒，不跑相機不耗電
@@ -79,7 +83,11 @@ class PageTurnService : AccessibilityService() {
                 refreshForeground() // 用活的 active window 校準，事件漏了也不瞎
                 if (overlayOn && ball == null && !surelyOutside()) showOverlay()
                 refreshBall()
-                if (tracker?.running == true) {
+                // 閒置超時：一段時間沒翻頁就關相機停球（省電，人走開不用管）
+                if (active() && SystemClock.uptimeMillis() - lastFlipAt > idleMs) {
+                    stop()
+                    Toast.makeText(this@PageTurnService, "${idleMs / 60000} 分鐘沒翻頁，已自動停止", Toast.LENGTH_SHORT).show()
+                } else if (tracker?.running == true) {
                     if (previewBox == null) showPreviewWindow()
                     else if (previewSurface != null && !trackerHasPreview) {
                         tracker?.stop() // 裸跑（沒接預覽面）→ 重啟接入
@@ -165,6 +173,13 @@ class PageTurnService : AccessibilityService() {
                 lastPkgAt = SystemClock.uptimeMillis()
             }
             if (pkg.isNotEmpty()) onForeground(pkg)
+        } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
+        ) {
+            // ponytail: 手動滑頁也算活著，閒置重數；自家事件與非白名單不算
+            if (active() && pkg.isNotEmpty() && pkg != packageName && isAllowed(pkg)) {
+                lastFlipAt = SystemClock.uptimeMillis()
+            }
         }
     }
 
@@ -201,9 +216,11 @@ class PageTurnService : AccessibilityService() {
 
     fun start() {
         if (!serviceOn) return
-        inOwnApp = false
+        refreshForeground()
+        if (inOwnApp) return // 自家頁點球無反應（第二層，點火只許在閱讀頁）
         running = true
         saveRunning(this)
+        lastFlipAt = SystemClock.uptimeMillis() // 從點火起算閒置
         updateCamera()
         refreshBall()
     }
@@ -327,8 +344,14 @@ class PageTurnService : AccessibilityService() {
         if (!ok) stop()
     }
 
-    private fun tapNextPage() = tapAt(0.8f) // 右中=下頁
-    private fun tapPrevPage() = tapAt(0.2f) // 左中=上頁
+    private fun tapNextPage() {
+        lastFlipAt = SystemClock.uptimeMillis()
+        tapAt(0.8f) // 右中=下頁
+    }
+    private fun tapPrevPage() {
+        lastFlipAt = SystemClock.uptimeMillis()
+        tapAt(0.2f) // 左中=上頁
+    }
 
     // ---- 懸浮球 ----
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -405,9 +428,13 @@ class PageTurnService : AccessibilityService() {
                 MotionEvent.ACTION_UP -> {
                     b.removeCallbacks(longPress)
                     if (!moved) {
-                        if (!serviceOn) {
-                            Toast.makeText(this, "先去設定頁開啟翻頁服務", Toast.LENGTH_SHORT).show()
-                        } else if (running) stop() else start()
+                        refreshForeground()
+                        // 自家頁點球無反應（第一層，拖移/長按不受影響）
+                        if (!inOwnApp) {
+                            if (!serviceOn) {
+                                Toast.makeText(this, "先去設定頁開啟翻頁服務", Toast.LENGTH_SHORT).show()
+                            } else if (running) stop() else start()
+                        }
                     }
                 }
                 MotionEvent.ACTION_CANCEL -> b.removeCallbacks(longPress)
