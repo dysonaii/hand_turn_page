@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.os.Handler
@@ -159,7 +160,37 @@ class PageTurnService : AccessibilityService() {
     private var previewBox: View? = null
     private var previewParams: WindowManager.LayoutParams? = null
     private var previewSurface: android.view.Surface? = null
+    private var previewOverlay: HandOverlay? = null
     private var previewPending = false
+
+    // ponytail: 蓋在 TextureView 上的透明層，只畫目標手勢的紅圈；不吃觸控（小窗照樣拖）
+    private inner class HandOverlay(ctx: Context) : View(ctx) {
+        var hg = 0; var hx = 0.5f; var hy = 0.5f
+        var rotDeg = 0 // 偵測圖轉了幾度（跟 HandTracker.sensorToDisplay 同源）
+        var totalDeg = 0 // 預覽轉了幾度（跟 fitPreview 的 total 同源）
+        private val ring = Paint().apply {
+            color = Color.RED; style = Paint.Style.STROKE
+            strokeWidth = dp(4).toFloat(); isAntiAlias = true
+        }
+        fun setHand(g: Int, cx: Float, cy: Float) { hg = g; hx = cx; hy = cy; invalidate() }
+        // ponytail: 偵測圖與預覽轉向不同（差 sensor 一整圈），座標要轉回同一系再套 HAL 鏡像；
+        // 轉幾度全從 sensor/display 現算，不寫死，橫豎通用
+        private fun rot(x: Float, y: Float, deg: Int): Pair<Float, Float> = when (((deg % 360) + 360) % 360) {
+            90 -> Pair(1 - y, x); 180 -> Pair(1 - x, 1 - y); 270 -> Pair(y, 1 - x); else -> Pair(x, y)
+        }
+        override fun onDraw(c: android.graphics.Canvas) {
+            super.onDraw(c)
+            if (hg != 1 && hg != 2) return
+            // ponytail: realme GT Neo2 實測對角反——偵測座標系差半圈，補 180；豎橫同式（兩路同 track disp）
+            val (xs, ys) = rot(hx, hy, 540 - rotDeg)
+            val (xu, yu) = rot(xs, ys, totalDeg)
+            val vx = (1 - xu) * width // HAL 自帶鏡像（豎屏已驗），App 不再翻
+            val vy = yu * height
+            val r = (minOf(width, height) * 0.22f).coerceAtLeast(dp(24).toFloat())
+            c.drawCircle(vx.coerceIn(r, (width - r).coerceAtLeast(r)), vy.coerceIn(r, (height - r).coerceAtLeast(r)), r, ring)
+        }
+        init { isClickable = false; isFocusable = false }
+    }
 
     override fun onServiceConnected() {
         instance = this
@@ -331,7 +362,8 @@ class PageTurnService : AccessibilityService() {
             this,
             onNext = { if (!flipBlocked()) tapNextPage() },
             onPrev = { if (!flipBlocked()) tapPrevPage() },
-            onStatus = {},
+            // ponytail: 紅圈蓋在手上，比底部文字一眼看出；文字提示退回設定頁測試窗
+            onHand = { g, cx, cy -> try { previewOverlay?.setHand(g, cx, cy) } catch (_: Exception) {} },
         ).also { tracker = it }
         t.cooldownMs = cooldownMs
         if (!t.start(ps)) {
@@ -492,12 +524,26 @@ class PageTurnService : AccessibilityService() {
         wm = w
         val maxW = (screenSize().first / 2).coerceAtLeast(dp(80))
         val initW = dp(previewWdp).coerceIn(dp(80), maxW)
+        // ponytail: 鏡子靠 HAL 自帶（realme 實測舉右手像舉左手），App 多翻一次等於翻回來，故不翻
         val tv = android.view.TextureView(this).apply { alpha = previewAlpha / 100f }
+        val overlay = HandOverlay(this)
+        previewOverlay = overlay
+        refreshOverlayGeom()
         val box = android.widget.FrameLayout(this).apply {
             setBackgroundColor(Color.parseColor("#CC000000"))
             addView(tv, android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(overlay, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+        // ponytail: 初次 post 時 view 可能還沒量好寬高（fitPreview 直接 return = 鏡像沒設上）；
+        // layout 穩定後再補一次，保證鏡像一定生效
+        tv.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            (v as? android.view.TextureView)?.let {
+                HandTracker.fitPreview(it, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this))
+            }
         }
         val pp = WindowManager.LayoutParams(
             initW, initW * 3 / 4,
@@ -515,7 +561,9 @@ class PageTurnService : AccessibilityService() {
                     startTracker(previewSurface)
                 }
             }
-            override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, ww: Int, hh: Int) {}
+            override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, ww: Int, hh: Int) {
+                tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this@PageTurnService), HandTracker.displayDeg(this@PageTurnService)) }
+            }
             override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
                 previewSurface = null; return true
             }
@@ -558,6 +606,15 @@ class PageTurnService : AccessibilityService() {
         } catch (_: Exception) { previewBox = null; previewParams = null }
     }
 
+    /** 疊加層幾何跟轉向走：旋轉/開關變化時重算，圈才一直套在手上。 */
+    private fun refreshOverlayGeom() {
+        previewOverlay?.apply {
+            val disp = HandTracker.displayDeg(this@PageTurnService)
+            rotDeg = (((HandTracker.frontSensorDeg(this@PageTurnService) - disp) % 360) + 360) % 360
+            totalDeg = (360 - disp) % 360
+        }
+    }
+
     /** 設定頁改大小/透明度＋轉屏後重算（轉正＋透明度即時生效）。 */
     private fun refitPreview() {
         val box = previewBox as? android.widget.FrameLayout ?: return
@@ -570,6 +627,7 @@ class PageTurnService : AccessibilityService() {
             tv.alpha = previewAlpha / 100f
             tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
         }
+        refreshOverlayGeom()
     }
 
     private fun hidePreviewWindow() {
@@ -577,6 +635,7 @@ class PageTurnService : AccessibilityService() {
         previewBox?.let { b -> try { w?.removeView(b) } catch (_: Exception) {} }
         previewBox = null
         previewParams = null
+        previewOverlay = null
         try { previewSurface?.release() } catch (_: Exception) {}
         previewSurface = null
     }

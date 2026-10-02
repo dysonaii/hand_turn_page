@@ -148,6 +148,13 @@ class MainActivity : Activity() {
         preview = TextureView(this).apply {
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(dp(200), dp(150))
+            // ponytail: 同小窗，layout 穩定後補鏡像，否則首幀 post 寬高=0 直接 return
+            addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                (v as? TextureView)?.let {
+                    if (it.visibility == View.VISIBLE)
+                        HandTracker.fitPreview(it, HandTracker.frontSensorDeg(this@MainActivity), HandTracker.displayDeg(this@MainActivity))
+                }
+            }
         }
         val gestureBtn = Button(this).apply {
             text = "手勢測試開/關（前鏡頭 30 秒）"
@@ -250,7 +257,9 @@ class MainActivity : Activity() {
                     st.setDefaultBufferSize(HandTracker.W, HandTracker.H)
                     if (testing && testTracker == null) beginTest(Surface(st))
                 }
-                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
+                    preview.post { HandTracker.fitPreview(preview, HandTracker.frontSensorDeg(this@MainActivity), HandTracker.displayDeg(this@MainActivity)) }
+                }
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture) = true
                 override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
             }

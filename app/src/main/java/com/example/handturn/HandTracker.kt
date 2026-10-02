@@ -26,6 +26,8 @@ class HandTracker(
     private val onNext: () -> Unit,
     private val onPrev: () -> Unit,
     private val onStatus: (String) -> Unit = {},
+    // ponytail: 小窗紅圈用——每幀推手勢＋手心概位（偵測座標系，未鏡像）；0=無手/非目標，不畫
+    private val onHand: (Int, Float, Float) -> Unit = { _, _, _ -> },
 ) {
     companion object {
         const val MODEL_ASSET = "hand_landmarker.task"
@@ -87,12 +89,10 @@ class HandTracker(
             m.setRectToRect(viewRect, bufRect, android.graphics.Matrix.ScaleToFit.FILL)
             val scale = maxOf(vh.toFloat() / bh, vw.toFloat() / bw)
             m.postScale(scale, scale, viewRect.centerX(), viewRect.centerY())
-            // ponytail: total 三方向實測收斂——豎屏 0、橫屏兩向各由 180/90 修正到 disp 本身；
-            // 即 total=dispDeg（sensor 在此機上掉出公式，參數保留以備他機）
-            val total = dispDeg
-            // ponytail: post 呼叫順序與像素生效順序相反——要「先轉正後鏡像」，
-            // 代碼必須先 postScale(鏡像) 再 postRotate，否則鏡像把旋轉方向翻轉，豎屏差 90 度
-            m.postScale(-1f, 1f, viewRect.centerX(), viewRect.centerY())
+            // ponytail: 顯示帶鏡像時旋轉取反才正——豎屏 0 不變，橫屏 90↔270 對調（180 自反不變）；
+            // sensor 在此機上掉出公式，參數保留以備他機
+            val total = (360 - dispDeg) % 360
+            // ponytail: 鏡像靠 HAL 自帶，不進矩陣——矩陣裡鏡像會跟旋轉打架；這裡只轉正＋填滿
             m.postRotate(total.toFloat(), viewRect.centerX(), viewRect.centerY())
             tv.setTransform(m)
         }
@@ -232,8 +232,12 @@ class HandTracker(
             val mk = landmarker ?: return
             val res = mk.detect(BitmapImageBuilder(bmp).build())
             val hands = res.landmarks()
-            if (hands.isEmpty()) { reset(); statusThrottled("手出鏡：再入鏡可翻"); return }
+            if (hands.isEmpty()) { reset(); statusThrottled("手出鏡：再入鏡可翻"); hand(0, 0f, 0f); return }
             val g = classify(hands[0])
+            // ponytail: 手心=21 點平均，夠畫圈用，不另算 bbox
+            var sx = 0f; var sy = 0f
+            for (p in hands[0]) { sx += p.x(); sy += p.y() }
+            hand(g, sx / hands[0].size, sy / hands[0].size)
             // 同手勢鎖住不連翻；換手勢（拳頭↔剪刀）直翻；出鏡清鎖
             if (g == 0) { lastGesture = 0; streak = 0; statusThrottled("拳頭=下頁，剪刀=上頁"); return }
             if (g == fired) { statusThrottled("已翻過：換手勢或出鏡後再比"); return }
@@ -251,6 +255,8 @@ class HandTracker(
     private fun reset() { lastGesture = 0; streak = 0; fired = 0 }
 
     private fun status(s: String) { main.post { try { onStatus(s) } catch (_: Exception) {} } }
+
+    private fun hand(g: Int, cx: Float, cy: Float) { main.post { try { onHand(g, cx, cy) } catch (_: Exception) {} } }
 
     private fun statusThrottled(s: String) {
         val now = android.os.SystemClock.uptimeMillis()
