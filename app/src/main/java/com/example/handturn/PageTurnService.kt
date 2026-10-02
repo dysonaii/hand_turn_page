@@ -33,6 +33,10 @@ class PageTurnService : AccessibilityService() {
         const val KEY_SERVICE = "service"
         const val KEY_ALPHA = "alpha"
         const val KEY_PVW = "pvw"
+        const val KEY_PVX_P = "pvxp"
+        const val KEY_PVY_P = "pvyp"
+        const val KEY_PVX_L = "pvxl"
+        const val KEY_PVY_L = "pvyl"
         const val KEY_PVALPHA = "pvAlpha"
         const val KEY_IDLE = "idle"
         val DEFAULT_APPS = setOf("com.tencent.weread")
@@ -45,6 +49,9 @@ class PageTurnService : AccessibilityService() {
         @Volatile var allowedApps: Set<String> = DEFAULT_APPS
         @Volatile var ballAlpha = 50
         @Volatile var previewWdp = 200 // 懸浮預覽窗寬 dp，高=寬*3/4；default 200x150
+        // ponytail: 位置直橫分開記（-1=沒擺過，用預設左上）；大小共用 previewWdp
+        @Volatile var pvXP = -1; @Volatile var pvYP = -1
+        @Volatile var pvXL = -1; @Volatile var pvYL = -1
         @Volatile var previewAlpha = 100
         @Volatile var idleMs = 5 * 60 * 1000L // 閒置多久沒翻頁自動停；default 5 分鐘
         @Volatile var currentPkg: String = ""
@@ -59,6 +66,8 @@ class PageTurnService : AccessibilityService() {
             allowedApps = p.getStringSet(KEY_APPS, DEFAULT_APPS) ?: DEFAULT_APPS
             ballAlpha = p.getInt(KEY_ALPHA, 50).coerceIn(10, 100)
             previewWdp = p.getInt(KEY_PVW, 200).coerceIn(80, 400)
+            pvXP = p.getInt(KEY_PVX_P, -1); pvYP = p.getInt(KEY_PVY_P, -1)
+            pvXL = p.getInt(KEY_PVX_L, -1); pvYL = p.getInt(KEY_PVY_L, -1)
             previewAlpha = p.getInt(KEY_PVALPHA, 100).coerceIn(10, 100)
             idleMs = p.getInt(KEY_IDLE, 5).coerceIn(1, 30) * 60 * 1000L
         }
@@ -245,8 +254,10 @@ class PageTurnService : AccessibilityService() {
             val maxW = (sw / 2).coerceAtLeast(dp(80))
             pp.width = pp.width.coerceIn(dp(80), maxW)
             pp.height = pp.width * 3 / 4
-            pp.x = pp.x.coerceIn(0, (sw - pp.width).coerceAtLeast(0))
-            pp.y = pp.y.coerceIn(0, (sh - pp.height).coerceAtLeast(0))
+            // ponytail: 轉向切到該向記住的位置；沒擺過就留在原地夾回可視範圍
+            val (sx, sy) = savedPos()
+            pp.x = (if (sx >= 0) sx else pp.x).coerceIn(0, (sw - pp.width).coerceAtLeast(0))
+            pp.y = (if (sy >= 0) sy else pp.y).coerceIn(0, (sh - pp.height).coerceAtLeast(0))
             if (previewBox != null) try { wm?.updateViewLayout(previewBox, pp) } catch (_: Exception) {}
         }
         refitPreview()
@@ -408,6 +419,10 @@ class PageTurnService : AccessibilityService() {
     // ---- 懸浮球 ----
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+    // ponytail: 位置直橫分開記，跟著當下方向讀寫
+    private fun isLandscape() = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    private fun savedPos(): Pair<Int, Int> = if (isLandscape()) pvXL to pvYL else pvXP to pvYP
+
     // ponytail: dispatchGesture 吃螢幕座標；displayMetrics 在橫屏/手勢列下會偏小，API 30+ 用真實螢幕尺寸
     private fun screenSize(): Pair<Int, Int> {
         try {
@@ -550,7 +565,13 @@ class PageTurnService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.START or Gravity.TOP; x = dp(16); y = dp(100) }
+        ).apply {
+            gravity = Gravity.START or Gravity.TOP
+            val (sw0, sh0) = screenSize()
+            val (sx0, sy0) = savedPos()
+            x = (if (sx0 >= 0) sx0 else dp(16)).coerceIn(0, (sw0 - initW).coerceAtLeast(0))
+            y = (if (sy0 >= 0) sy0 else dp(100)).coerceIn(0, (sh0 - initW * 3 / 4).coerceAtLeast(0))
+        }
         tv.surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, ww: Int, hh: Int) {
                 st.setDefaultBufferSize(HandTracker.W, HandTracker.H) // 固定 4:3，轉正矩陣才對得上
@@ -588,11 +609,15 @@ class PageTurnService : AccessibilityService() {
                     tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val e = getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                     if (resizing) {
                         previewWdp = (pp.width / resources.displayMetrics.density).toInt().coerceIn(80, 400)
-                        getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                            .edit().putInt(KEY_PVW, previewWdp).apply()
+                        e.putInt(KEY_PVW, previewWdp)
                     }
+                    // ponytail: 抬手即存位置（直橫分槽），服務被殺也不丟
+                    if (isLandscape()) { pvXL = pp.x; pvYL = pp.y; e.putInt(KEY_PVX_L, pp.x).putInt(KEY_PVY_L, pp.y) }
+                    else { pvXP = pp.x; pvYP = pp.y; e.putInt(KEY_PVX_P, pp.x).putInt(KEY_PVY_P, pp.y) }
+                    e.apply()
                     resizing = false
                 }
             }
