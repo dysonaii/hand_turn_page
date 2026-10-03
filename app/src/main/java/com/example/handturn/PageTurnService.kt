@@ -21,7 +21,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
 import android.widget.Toast
 
-/** 手勢翻頁：讚=下頁，七=上頁。前鏡頭只在閱讀時開，其餘門控沿用自動翻頁版。 */
+/** 手勢翻頁：拳頭=下頁，剪刀=上頁，手掌=綠圈不翻。前鏡頭只在閱讀時開，其餘門控沿用自動翻頁版。 */
 class PageTurnService : AccessibilityService() {
 
     companion object {
@@ -172,13 +172,21 @@ class PageTurnService : AccessibilityService() {
     private var previewOverlay: HandOverlay? = null
     private var previewPending = false
 
-    // ponytail: 蓋在 TextureView 上的透明層，只畫目標手勢的紅圈；不吃觸控（小窗照樣拖）
+    // ponytail: 蓋在 TextureView 上的透明層，只畫目標手勢的圈；不吃觸控（小窗照樣拖）
     private inner class HandOverlay(ctx: Context) : View(ctx) {
         var hg = 0; var hx = 0.5f; var hy = 0.5f
         var rotDeg = 0 // 偵測圖轉了幾度（跟 HandTracker.sensorToDisplay 同源）
         var totalDeg = 0 // 預覽轉了幾度（跟 fitPreview 的 total 同源）
-        private val ring = Paint().apply {
+        private val red = Paint().apply {
             color = Color.RED; style = Paint.Style.STROKE
+            strokeWidth = dp(4).toFloat(); isAntiAlias = true
+        }
+        private val yellow = Paint().apply {
+            color = Color.YELLOW; style = Paint.Style.STROKE
+            strokeWidth = dp(4).toFloat(); isAntiAlias = true
+        }
+        private val green = Paint().apply {
+            color = Color.GREEN; style = Paint.Style.STROKE
             strokeWidth = dp(4).toFloat(); isAntiAlias = true
         }
         fun setHand(g: Int, cx: Float, cy: Float) { hg = g; hx = cx; hy = cy; invalidate() }
@@ -189,7 +197,8 @@ class PageTurnService : AccessibilityService() {
         }
         override fun onDraw(c: android.graphics.Canvas) {
             super.onDraw(c)
-            if (hg != 1 && hg != 2) return
+            if (hg != 1 && hg != 2 && hg != 3) return
+            val ring = when (hg) { 1 -> red; 2 -> yellow; else -> green } // 拳頭紅，剪刀黃，手掌綠
             // ponytail: realme GT Neo2 實測對角反——偵測座標系差半圈，補 180；豎橫同式（兩路同 track disp）
             val (xs, ys) = rot(hx, hy, 540 - rotDeg)
             val (xu, yu) = rot(xs, ys, totalDeg)
@@ -373,7 +382,7 @@ class PageTurnService : AccessibilityService() {
             this,
             onNext = { if (!flipBlocked()) tapNextPage() },
             onPrev = { if (!flipBlocked()) tapPrevPage() },
-            // ponytail: 紅圈蓋在手上，比底部文字一眼看出；文字提示退回設定頁測試窗
+            // ponytail: 三色圈蓋在手上，比底部文字一眼看出；文字提示退回設定頁測試窗
             onHand = { g, cx, cy -> try { previewOverlay?.setHand(g, cx, cy) } catch (_: Exception) {} },
         ).also { tracker = it }
         t.cooldownMs = cooldownMs

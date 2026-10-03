@@ -168,7 +168,7 @@ class MainActivity : Activity() {
             addView(accessBtn)
             addView(overlayBtn)
             addView(cameraBtn)
-            addView(TextView(context).apply { text = "手勢：拳頭=下頁，剪刀（食指+中指）=上頁；同手勢不連翻" })
+            addView(TextView(context).apply { text = "手勢：拳頭=下頁，剪刀（食指+中指）=上頁，手掌=綠圈不翻；同手勢不連翻" })
             addView(coolLabel)
             addView(coolSeek)
             addView(idleLabel)

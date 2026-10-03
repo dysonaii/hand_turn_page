@@ -20,13 +20,13 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker.HandLandm
 import java.nio.ByteBuffer
 import kotlin.math.hypot
 
-/** 手勢：讚=下頁，七=上頁（不分左右手）。Camera2 前鏡頭 + MediaPipe，幾何規則分類。 */
+/** 手勢：拳頭=下頁，剪刀=上頁，手掌=綠圈不翻（當換手勢解鎖）。Camera2 前鏡頭 + MediaPipe，幾何規則分類。 */
 class HandTracker(
     private val ctx: Context,
     private val onNext: () -> Unit,
     private val onPrev: () -> Unit,
     private val onStatus: (String) -> Unit = {},
-    // ponytail: 小窗紅圈用——每幀推手勢＋手心概位（偵測座標系，未鏡像）；0=無手/非目標，不畫
+    // ponytail: 小窗圈色用——每幀推手勢＋手心概位（偵測座標系，未鏡像）；0=無手/非目標，不畫；1=拳頭紅圈下頁，2=剪刀黃圈上頁，3=手掌綠圈不翻
     private val onHand: (Int, Float, Float) -> Unit = { _, _, _ -> },
 ) {
     companion object {
@@ -39,13 +39,16 @@ class HandTracker(
         fun classify(lm: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>): Int {
             fun dist(a: Int, b: Int) = hypot((lm[a].x() - lm[b].x()).toDouble(), (lm[a].y() - lm[b].y()).toDouble())
             fun extended(tip: Int, pip: Int) = dist(tip, 0) > dist(pip, 0) * 1.15
-            val thumb = dist(4, 17) > dist(2, 17) * 1.2
-            val idx = extended(8, 6)
-            val mid = extended(12, 10)
-            val ring = extended(16, 14)
-            val pinky = extended(20, 18)
-            if (!thumb && !idx && !mid && !ring && !pinky) return 1 // 拳頭=下頁
-            if (!thumb && idx && mid && !ring && !pinky) return 2 // 剪刀=上頁
+            // ponytail: 手背朝鏡頭時整手透視壓扁，腕比會失效；加局部伸直（指尖-掌根 > 指節-掌根 ×1.6）當 OR，正反面皆通
+            fun straight(tip: Int, pip: Int, mcp: Int) = dist(tip, mcp) > dist(pip, mcp) * 1.6
+            val thumbWide = dist(4, 17) > dist(2, 17) * 1.2 // 拇指張開（手心/手背皆成立）
+            val idx = extended(8, 6) || straight(8, 6, 5)
+            val mid = extended(12, 10) || straight(12, 10, 9)
+            val ring = extended(16, 14) || straight(16, 14, 13)
+            val pinky = extended(20, 18) || straight(20, 18, 17)
+            if (!thumbWide && !idx && !mid && !ring && !pinky) return 1 // 拳頭=下頁
+            if (!thumbWide && idx && mid && !ring && !pinky) return 2 // 剪刀=上頁（拇指內收也算）
+            if (idx && mid && ring && pinky) return 3 // 手掌=綠圈不翻（四指伸就算，拇指怎麼擺都算）
             return 0
         }
 
@@ -102,12 +105,13 @@ class HandTracker(
             com.google.mediapipe.tasks.components.containers.NormalizedLandmark.create(x, y, 0f)
 
         fun demo(): String {
-            // 0=拳頭 1=剪刀 2=手掌 3=讚
+            // 0=拳頭 1=剪刀 2=手掌 3=讚 4=手背手掌（拇指內收） 5=手背剪刀 6=拳頭拇指橫壓 7=手掌拇指屈折貼掌
             fun hand(mode: Int): List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark> {
-                val idxOut = mode == 1 || mode == 2
-                val midOut = mode == 1 || mode == 2
-                val restOut = mode == 2
-                val thumbOut = mode == 2 || mode == 3
+                val base = when (mode) { 4 -> 2; 5 -> 1; 6 -> 0; 7 -> 2; else -> mode }
+                val idxOut = base == 1 || base == 2
+                val midOut = base == 1 || base == 2
+                val restOut = base == 2
+                val thumbOut = base == 2 || base == 3
                 val p = Array(21) { lm(0.5f, 0.6f) }.toMutableList()
                 p[0] = lm(0.5f, 0.9f)
                 p[2] = lm(0.45f, 0.6f); p[4] = if (thumbOut) lm(0.2f, 0.5f) else lm(0.45f, 0.62f)
@@ -115,12 +119,20 @@ class HandTracker(
                 p[10] = lm(0.6f, 0.5f); p[12] = if (midOut) lm(0.6f, 0.2f) else lm(0.6f, 0.58f)
                 p[14] = lm(0.65f, 0.5f); p[16] = if (restOut) lm(0.65f, 0.2f) else lm(0.65f, 0.58f)
                 p[17] = lm(0.7f, 0.55f); p[18] = lm(0.72f, 0.5f); p[20] = if (restOut) lm(0.72f, 0.2f) else lm(0.72f, 0.58f)
+                if (mode == 4) p[4] = lm(0.52f, 0.35f) // 手背：拇指內收貼食指，腕比失效、局部仍直
+                if (mode == 5) p[4] = lm(0.53f, 0.38f) // 手背剪刀：拇指內收
+                if (mode == 6) p[4] = lm(0.62f, 0.58f) // 拳頭拇指橫壓指上
+                if (mode == 7) p[4] = lm(0.52f, 0.58f) // 手掌拇指屈折貼掌：四指伸就算
                 return p
             }
             check(classify(hand(0)) == 1) { "拳頭應=1" }
             check(classify(hand(1)) == 2) { "剪刀應=2" }
-            check(classify(hand(2)) == 0) { "手掌應=0" }
+            check(classify(hand(2)) == 3) { "手掌應=3" }
             check(classify(hand(3)) == 0) { "讚應=0" }
+            check(classify(hand(4)) == 3) { "手背手掌應=3" }
+            check(classify(hand(5)) == 2) { "手背剪刀應=2" }
+            check(classify(hand(6)) == 1) { "拳頭（拇指橫壓）應=1" }
+            check(classify(hand(7)) == 3) { "手掌（拇指屈折）應=3" }
             return "HandTracker demo OK"
         }
     }
@@ -238,8 +250,14 @@ class HandTracker(
             var sx = 0f; var sy = 0f
             for (p in hands[0]) { sx += p.x(); sy += p.y() }
             hand(g, sx / hands[0].size, sy / hands[0].size)
-            // 同手勢鎖住不連翻；換手勢（拳頭↔剪刀）直翻；出鏡清鎖
+            // 同手勢鎖住不連翻；手掌只解鎖不翻；拳頭↔剪刀、手掌→拳頭/剪刀直切即翻；出鏡清鎖
             if (g == 0) { lastGesture = 0; streak = 0; statusThrottled("拳頭=下頁，剪刀=上頁"); return }
+            if (g == 3) {
+                if (g == lastGesture) streak++ else { lastGesture = g; streak = 1 }
+                if (streak >= NEED_FRAMES) fired = 0 // 穩定手掌當換手勢，解掉同手勢鎖
+                statusThrottled("看到：手掌（不翻頁）$streak/3")
+                return
+            }
             if (g == fired) { statusThrottled("已翻過：換手勢或出鏡後再比"); return }
             if (g == lastGesture) streak++ else { lastGesture = g; streak = 1 }
             statusThrottled(if (g == 1) "看到：拳頭（下頁）$streak/3" else "看到：剪刀（上頁）$streak/3")
