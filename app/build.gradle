@@ -30,5 +30,5 @@ android {
 
 dependencies {
     // ponytail: 手部關鍵點唯一外來依賴；Camera2 用內建，分類規則自寫幾何
-    implementation 'com.google.mediapipe:tasks-vision:0.10.14'
+    implementation 'com.google.mediapipe:tasks-vision:0.10.26.1'
 }
