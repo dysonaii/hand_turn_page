@@ -35,6 +35,7 @@ class HandTracker(
         const val H = 360
         private const val FRAME_GAP_MS = 100L // ~10fps，省電且夠用
         private const val NEED_FRAMES = 3 // 連續同手勢才觸發，防抖
+        private const val GRACE_MS = 1500L // ponytail: 開機寬限——點球時手還在鏡頭前，不等撤手就秒翻+跑條
         // ponytail: 純距離幾何，不訓練分類器；鏡像不影響伸/屈判斷
         fun classify(lm: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>): Int {
             fun dist(a: Int, b: Int) = hypot((lm[a].x() - lm[b].x()).toDouble(), (lm[a].y() - lm[b].y()).toDouble())
@@ -149,7 +150,8 @@ class HandTracker(
     private var lastGesture = 0
     private var streak = 0
     private var fired = 0 // 已觸發的手勢；同手勢鎖住，換手勢或出鏡才解
-    private var lastFireAt = 0L
+    @Volatile var lastFireAt = 0L // ponytail: 冷卻條讀這個算進度，0=還沒翻過=就緒
+    @Volatile var startAt = 0L // ponytail: 本輪開機時間，寬限內不辨識
     private var lastStatusAt = 0L
     @Volatile var cooldownMs = 1500L
     @Volatile var running = false
@@ -207,6 +209,7 @@ class HandTracker(
                 override fun onError(d: android.hardware.camera2.CameraDevice, e: Int) { status("相機錯誤 $e"); stop() }
             }, bg)
             running = true
+            startAt = android.os.SystemClock.uptimeMillis()
             return true
         } catch (e: SecurityException) {
             status("缺相機權限"); stop(); return false
@@ -231,7 +234,7 @@ class HandTracker(
         if (img == null) return
         try {
             val now = android.os.SystemClock.uptimeMillis()
-            if (!running || busy || now - lastFrameAt < FRAME_GAP_MS) return
+            if (!running || busy || now - lastFrameAt < FRAME_GAP_MS || now - startAt < GRACE_MS) return
             lastFrameAt = now
             busy = true
             val bmp = yuvToBitmap(img, rot)

@@ -171,6 +171,50 @@ class PageTurnService : AccessibilityService() {
     private var previewSurface: android.view.Surface? = null
     private var previewOverlay: HandOverlay? = null
     private var previewPending = false
+    private var cooldownBar: View? = null // ponytail: 冷卻進度條，預覽窗的子 view，不另開懸浮窗
+
+    // ponytail: 100ms 刷一次 scale，不走 layout（省電）；滿格=冷卻結束可翻
+    private val cooldownTick = object : Runnable {
+        override fun run() {
+            try { updateCooldownBar() } catch (_: Exception) {
+            } finally {
+                handler.postDelayed(this, 100)
+            }
+        }
+    }
+
+    private fun updateCooldownBar() {
+        val bar = cooldownBar ?: return
+        val t = tracker
+        val frac = if (t == null || t.lastFireAt == 0L) 0f
+            else (1f - (SystemClock.uptimeMillis() - t.lastFireAt).toFloat() / t.cooldownMs.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+        if (frac <= 0f) { bar.visibility = View.GONE; return } // ponytail: 縮完消失，沒條=可翻
+        bar.visibility = View.VISIBLE
+        if (isLandscape()) {
+            bar.scaleX = 1f
+            bar.pivotX = 0f
+            bar.pivotY = bar.height.toFloat()
+            bar.scaleY = frac
+        } else {
+            bar.scaleY = 1f
+            bar.pivotX = 0f
+            bar.pivotY = bar.height.toFloat()
+            bar.scaleX = frac
+        }
+    }
+
+    // ponytail: 直屏=窗底橫條滿寬，橫屏=窗左豎條滿高；轉屏由 refitPreview 重調
+    private fun layoutCooldownBar() {
+        val bar = cooldownBar ?: return
+        val s = dp(6)
+        bar.layoutParams = android.widget.FrameLayout.LayoutParams(
+            if (isLandscape()) s else android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            if (isLandscape()) android.widget.FrameLayout.LayoutParams.MATCH_PARENT else s,
+            if (isLandscape()) Gravity.START or Gravity.TOP else Gravity.BOTTOM
+        )
+        bar.scaleX = 1f; bar.scaleY = 1f
+        bar.post { updateCooldownBar() }
+    }
 
     // ponytail: 蓋在 TextureView 上的透明層，只畫目標手勢的圈；不吃觸控（小窗照樣拖）
     private inner class HandOverlay(ctx: Context) : View(ctx) {
@@ -220,6 +264,8 @@ class PageTurnService : AccessibilityService() {
         if (serviceOn && running) updateCamera()
         handler.removeCallbacks(watchdog)
         handler.post(watchdog)
+        handler.removeCallbacks(cooldownTick)
+        handler.post(cooldownTick)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -276,6 +322,7 @@ class PageTurnService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         handler.removeCallbacks(watchdog)
+        handler.removeCallbacks(cooldownTick)
         releaseCamera()
         tracker?.close(); tracker = null
         hideOverlay()
@@ -290,6 +337,7 @@ class PageTurnService : AccessibilityService() {
         running = true
         saveRunning(this)
         lastFlipAt = SystemClock.uptimeMillis() // 從點火起算閒置
+        tracker?.lastFireAt = 0L // ponytail: 新會話不繼承舊冷卻，免得一開就跑一次綠條
         updateCamera()
         refreshBall()
     }
@@ -321,7 +369,9 @@ class PageTurnService : AccessibilityService() {
         "android",
         "com.android.systemui",
         "com.android.permissioncontroller",
-        "com.android.packageinstaller"
+        "com.android.packageinstaller",
+        "com.example.eyeturn", // ponytail: 兄弟 App 當系統彈窗忽略，否則對方球/窗一動就被當外面藏球停相機
+        "com.example.auto_turn_page"
     )
 
     private fun isLauncher(pkg: String): Boolean {
@@ -562,6 +612,16 @@ class PageTurnService : AccessibilityService() {
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
         }
+        // ponytail: 淡綠冷卻條壓在最上層，滿格=可翻；直屏窗底橫條，橫屏窗左豎條
+        val cbar = View(this).apply {
+            setBackgroundColor(Color.parseColor("#CC90EE90"))
+            isClickable = false; isFocusable = false
+            visibility = View.GONE // ponytail: 預設藏，免得剛建窗閃一次滿格綠條
+        }
+        cooldownBar = cbar
+        box.addView(cbar, android.widget.FrameLayout.LayoutParams(
+            android.widget.FrameLayout.LayoutParams.MATCH_PARENT, dp(6), Gravity.BOTTOM))
+        layoutCooldownBar()
         // ponytail: 初次 post 時 view 可能還沒量好寬高（fitPreview 直接 return = 鏡像沒設上）；
         // layout 穩定後再補一次，保證鏡像一定生效
         tv.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
@@ -657,6 +717,7 @@ class PageTurnService : AccessibilityService() {
         pp.width = dp(previewWdp).coerceIn(dp(80), maxW)
         pp.height = pp.width * 3 / 4
         try { wm?.updateViewLayout(box, pp) } catch (_: Exception) {}
+        layoutCooldownBar()
         (box.getChildAt(0) as? android.view.TextureView)?.let { tv ->
             tv.alpha = previewAlpha / 100f
             tv.post { HandTracker.fitPreview(tv, HandTracker.frontSensorDeg(this), HandTracker.displayDeg(this)) }
@@ -670,6 +731,7 @@ class PageTurnService : AccessibilityService() {
         previewBox = null
         previewParams = null
         previewOverlay = null
+        cooldownBar = null // 跟著窗一起走，tick 會自己空轉等下次 show
         try { previewSurface?.release() } catch (_: Exception) {}
         previewSurface = null
     }
