@@ -47,7 +47,7 @@
 
 ## 模型檔（編譯前必放）
 
-`app/src/main/assets/hand_landmarker.task` 沒進 git（約 8MB），直接抓官方檔放進 `app/src/main/assets/`：
+`app/src/main/assets/hand_landmarker.task` 沒進 git（約 8MB），build 時缺檔自動抓官方檔（可手動放）：
 
 `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`
 

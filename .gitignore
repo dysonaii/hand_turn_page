@@ -8,6 +8,8 @@ local.properties
 # signing
 *.jks
 *.keystore
+# models (8MB+ 下載放 assets，不進 git)
+*.task
 # OS
 Thumbs.db
 .DS_Store
